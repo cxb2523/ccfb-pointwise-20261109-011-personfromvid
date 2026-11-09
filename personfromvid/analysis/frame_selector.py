@@ -15,7 +15,26 @@ from ..utils.logging import get_logger
 
 @dataclass
 class SelectionCriteria:
-    """Criteria for frame selection."""
+    """Criteria for frame selection.
+
+    temporal_diversity_threshold and diversity_window_size both bound how
+    aggressively near-duplicate-in-time frames are suppressed, but they act at
+    different stages and trade off against each other:
+
+    - diversity_window_size (seconds) groups raw candidates into temporal
+      clusters *before* ranking, so only each cluster's best-scoring frame
+      competes for a selection slot. Too large a window merges genuinely
+      distinct brief pose events into one cluster, so the representative
+      frame for the shorter event gets crowded out by the surrounding,
+      higher-scoring cluster. Too small a window fragments one continuous
+      pose event into many single-frame clusters that then all compete
+      independently for the same max_frames_per_category budget, diluting
+      the slots that should go to short-lived distinct poses. 0 disables
+      clustering (every frame is its own cluster).
+    - temporal_diversity_threshold (seconds) is the final safety-net minimum
+      spacing enforced between any two *selected* representatives, applied
+      after clustering, in case diversity_window_size is set smaller than it.
+    """
 
     min_frames_per_category: int
     max_frames_per_category: int
@@ -24,6 +43,7 @@ class SelectionCriteria:
     quality_weight: float
     diversity_threshold: float
     temporal_diversity_threshold: float
+    diversity_window_size: float = 0.0
 
 
 @dataclass
@@ -93,6 +113,14 @@ class FrameSelector:
         """
         self.criteria = criteria
         self.logger = get_logger(f"{__name__}.FrameSelector")
+
+        if self.criteria.diversity_window_size > self.criteria.temporal_diversity_threshold > 0:
+            self.logger.warning(
+                f"diversity_window_size ({self.criteria.diversity_window_size}s) exceeds "
+                f"temporal_diversity_threshold ({self.criteria.temporal_diversity_threshold}s); "
+                "distinct brief pose events closer together than the window will be merged "
+                "into a single cluster before the threshold ever gets a chance to apply."
+            )
 
         # Categories we're interested in
         self.pose_categories = ["standing", "sitting", "squatting", "closeup"]
@@ -325,6 +353,14 @@ class FrameSelector:
     ) -> Tuple[List[FrameData], List[FrameData]]:
         """Select diverse frames to avoid similar selections.
 
+        Candidates are first grouped into temporal clusters (see
+        SelectionCriteria.diversity_window_size), and only the best-scoring
+        frame per cluster competes for a selection slot. This stops one
+        long, high-scoring burst of near-duplicate frames from exhausting
+        max_count before a later, briefer, lower-scoring pose event is ever
+        considered - the cluster representatives are ranked by score
+        globally, not by arrival order within the raw candidate list.
+
         Args:
             scored_frames: List of (frame, score) tuples sorted by score
             max_count: Maximum number of frames to select
@@ -336,10 +372,36 @@ class FrameSelector:
         if not scored_frames:
             return [], []
 
-        selected = []
-        rejected_diversity = []
+        clusters = self._cluster_frames_by_time_window(scored_frames)
 
-        for i, (frame, _score) in enumerate(scored_frames):
+        # Each cluster's best-scoring frame represents that temporal event.
+        # Non-representative cluster members are near-duplicates of their
+        # cluster's representative, so they are explicitly recorded as
+        # diversity rejections rather than silently disappearing.
+        cluster_reps: List[Tuple[FrameData, float]] = []
+        rejected_diversity: List[FrameData] = []
+        for cluster in clusters:
+            best_frame, best_score = max(cluster, key=lambda fs: fs[1])
+            cluster_reps.append((best_frame, best_score))
+            for frame, _score in cluster:
+                if frame.frame_id != best_frame.frame_id:
+                    rejected_diversity.append(frame)
+
+        if len(clusters) != len(scored_frames):
+            self.logger.debug(
+                f"Clustered {len(scored_frames)} candidates into {len(clusters)} "
+                f"temporal groups (window={self.criteria.diversity_window_size}s) "
+                "before ranking representatives"
+            )
+
+        # Rank cluster representatives by score so the best distinct pose
+        # events are selected first, regardless of how many raw frames their
+        # competing clusters happened to contain.
+        cluster_reps.sort(key=lambda item: item[1], reverse=True)
+
+        selected: List[FrameData] = []
+
+        for i, (frame, _score) in enumerate(cluster_reps):
             if len(selected) >= max_count:
                 # Frames that exceed max count are not processed further
                 break
@@ -348,14 +410,57 @@ class FrameSelector:
             if interruption_check and i % 5 == 0:
                 interruption_check()
 
-            # Check diversity against already selected frames
+            # Final safety-net check against already selected representatives,
+            # in case diversity_window_size is smaller than
+            # temporal_diversity_threshold and two cluster reps still end up
+            # closer together than the minimum spacing requires.
             if self._is_diverse_enough(frame, selected):
                 selected.append(frame)
             else:
-                # Frame rejected due to insufficient diversity
                 rejected_diversity.append(frame)
 
         return selected, rejected_diversity
+
+    def _cluster_frames_by_time_window(
+        self, scored_frames: List[Tuple[FrameData, float]]
+    ) -> List[List[Tuple[FrameData, float]]]:
+        """Group candidate frames into temporal clusters.
+
+        Frames are sorted chronologically; a new cluster starts whenever the
+        gap to the previous frame's timestamp exceeds
+        `criteria.diversity_window_size` seconds. A window of 0 (default)
+        disables clustering, so every frame is its own cluster - this
+        preserves the original per-frame greedy selection behavior exactly.
+
+        Args:
+            scored_frames: List of (frame, score) tuples
+
+        Returns:
+            List of clusters, each a list of (frame, score) tuples
+        """
+        window = self.criteria.diversity_window_size
+        by_time = sorted(
+            scored_frames, key=lambda fs: fs[0].source_info.video_timestamp
+        )
+
+        if window <= 0:
+            return [[fs] for fs in by_time]
+
+        clusters: List[List[Tuple[FrameData, float]]] = []
+        current_cluster: List[Tuple[FrameData, float]] = [by_time[0]]
+        prev_timestamp = by_time[0][0].source_info.video_timestamp
+
+        for frame, score in by_time[1:]:
+            timestamp = frame.source_info.video_timestamp
+            if timestamp - prev_timestamp <= window:
+                current_cluster.append((frame, score))
+            else:
+                clusters.append(current_cluster)
+                current_cluster = [(frame, score)]
+            prev_timestamp = timestamp
+
+        clusters.append(current_cluster)
+        return clusters
 
     def _is_diverse_enough(
         self, candidate: FrameData, selected: List[FrameData]

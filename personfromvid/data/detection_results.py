@@ -141,6 +141,10 @@ class CloseupDetection:
     inter_ocular_distance: Optional[float] = None  # Distance between eyes in pixels
     estimated_distance: Optional[str] = None  # "very_close", "close", "medium", "far"
     shoulder_width_ratio: Optional[float] = None  # Shoulder width / frame width
+    near_frame_edge: bool = False  # Face bbox touches/extends past the frame boundary
+    overlaps_other_face: bool = False  # Face bbox significantly overlaps another face
+    detection_failed: bool = False  # True if detection could not be computed (explicit failure marker)
+    failure_reason: Optional[str] = None  # Why detection_failed is True
 
     def __post_init__(self) -> None:
         """Validate detection results and initialize lists."""

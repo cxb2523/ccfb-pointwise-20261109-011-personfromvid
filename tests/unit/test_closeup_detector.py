@@ -438,3 +438,246 @@ class TestCloseupDetector:
         # Frame without pose data should not have shoulder width ratio
         assert frame1.closeup_detections[0].shoulder_width_ratio is None
 
+
+class TestCloseupDetectorEdgeAndOverlapHandling:
+    """Boundary tests for faces near the frame edge, overlapping faces, and
+    detection failures - these must always produce an explicit, traceable
+    result instead of silently dropping the face's entry.
+    """
+
+    def setup_method(self):
+        """Set up test fixtures."""
+        self.detector = CloseupDetector()
+        self.image_properties = ImageProperties(
+            width=1920,
+            height=1080,
+            channels=3,
+            file_size_bytes=1000000,
+            format="JPG",
+        )
+        self.source_info = SourceInfo(
+            video_timestamp=1.0,
+            extraction_method="test",
+            original_frame_number=1,
+            video_fps=30.0,
+        )
+
+    def create_frame_data(self, face_detections=None, pose_detections=None):
+        return FrameData(
+            frame_id="edge_test_frame",
+            file_path=Path("/tmp/test.jpg"),
+            source_info=self.source_info,
+            image_properties=self.image_properties,
+            face_detections=face_detections or [],
+            pose_detections=pose_detections or [],
+        )
+
+    def test_face_bbox_extending_past_frame_edge_is_not_silently_dropped(self):
+        """A face bbox extending beyond the frame boundary must still produce
+        a usable, explicitly-flagged CloseupDetection instead of raising
+        inside CloseupDetection.__post_init__ (face_area_ratio > 1.0) and
+        being swallowed - that silent drop is exactly what makes a
+        legitimately-selected frame vanish from the "closeup" pose category.
+        """
+        # 500x500 bbox positioned so it extends 120px past the right/bottom edges
+        bbox = (1700, 900, 2200, 1400)
+        face = FaceDetection(bbox=bbox, confidence=0.9, landmarks=None)
+        frame = self.create_frame_data([face])
+
+        self.detector.detect_closeups_in_frame(frame)
+
+        # Every face must produce exactly one entry - never silently dropped.
+        assert len(frame.closeup_detections) == 1
+        result = frame.closeup_detections[0]
+
+        assert result.detection_failed is False
+        assert result.near_frame_edge is True
+        # Ratio must be computed from the visible (clamped) region, never > 1.0
+        assert 0.0 <= result.face_area_ratio <= 1.0
+        visible_area = (1920 - 1700) * (1080 - 900)
+        expected_ratio = visible_area / (1920 * 1080)
+        assert result.face_area_ratio == expected_ratio
+
+    def test_grossly_oversized_edge_bbox_no_longer_raises_or_vanishes(self):
+        """Regression test for the root-cause bug: a bbox whose raw (unclamped)
+        area exceeds the frame area used to raise ValueError inside
+        CloseupDetection.__post_init__ (face_area_ratio > 1.0), which the old
+        blanket except/continue swallowed - leaving closeup_detections empty
+        for a face that legitimately exists. is_closeup_shot() would then
+        return False and frame_selector.group_by_pose() would never place
+        this frame in the "closeup" bucket, so a frame that should have been
+        selected silently disappears instead.
+        """
+        bbox = (-200, -200, 2200, 1300)  # raw area > frame area
+        face = FaceDetection(bbox=bbox, confidence=0.9, landmarks=None)
+        frame = self.create_frame_data([face])
+
+        self.detector.detect_closeups_in_frame(frame)
+
+        assert len(frame.closeup_detections) == 1
+        result = frame.closeup_detections[0]
+        assert result.detection_failed is False
+        assert result.near_frame_edge is True
+        assert result.face_area_ratio == 1.0
+        assert result.is_closeup is True
+        assert frame.is_closeup_shot() is True
+
+    def test_face_bbox_touching_edge_within_margin_is_flagged(self):
+        """A bbox fully inside the frame but within the configured edge margin
+        must be explicitly flagged, not treated as an ordinary interior face.
+        """
+        # Small face starting at x=0,y=0 - inside the default 2% margin
+        bbox = (0, 0, 50, 50)
+        face = FaceDetection(bbox=bbox, confidence=0.9, landmarks=None)
+        frame = self.create_frame_data([face])
+
+        self.detector.detect_closeups_in_frame(frame)
+
+        result = frame.closeup_detections[0]
+        assert result.detection_failed is False
+        assert result.near_frame_edge is True
+
+    def test_face_well_inside_frame_is_not_flagged_as_near_edge(self):
+        """Sanity check: a face far from any edge should not be flagged."""
+        bbox = (800, 400, 1000, 600)
+        face = FaceDetection(bbox=bbox, confidence=0.9, landmarks=None)
+        frame = self.create_frame_data([face])
+
+        self.detector.detect_closeups_in_frame(frame)
+
+        result = frame.closeup_detections[0]
+        assert result.near_frame_edge is False
+
+    def test_overlapping_faces_are_explicitly_flagged_not_skipped(self):
+        """Two heavily-overlapping face bboxes (e.g. a double-detection on the
+        same person, or two people standing very close) must each get an
+        explicit overlaps_other_face=True result with a recorded reason,
+        rather than being processed as if nothing unusual were happening or
+        being skipped.
+        """
+        face_a = FaceDetection(bbox=(500, 300, 700, 500), confidence=0.9, landmarks=None)
+        face_b = FaceDetection(bbox=(520, 310, 720, 510), confidence=0.85, landmarks=None)
+        frame = self.create_frame_data([face_a, face_b])
+
+        self.detector.detect_closeups_in_frame(frame)
+
+        assert len(frame.closeup_detections) == 2
+        assert frame.closeup_detections[0].overlaps_other_face is True
+        assert frame.closeup_detections[1].overlaps_other_face is True
+        assert frame.closeup_detections[0].detection_failed is False
+        assert frame.closeup_detections[1].detection_failed is False
+
+    def test_non_overlapping_faces_are_not_flagged(self):
+        """Sanity check: faces far apart must not be flagged as overlapping."""
+        face_a = FaceDetection(bbox=(100, 100, 200, 200), confidence=0.9, landmarks=None)
+        face_b = FaceDetection(bbox=(1500, 800, 1600, 900), confidence=0.9, landmarks=None)
+        frame = self.create_frame_data([face_a, face_b])
+
+        self.detector.detect_closeups_in_frame(frame)
+
+        assert frame.closeup_detections[0].overlaps_other_face is False
+        assert frame.closeup_detections[1].overlaps_other_face is False
+
+    def test_detection_failure_recovers_on_retry(self, monkeypatch):
+        """A transient failure on the first attempt must be retried, and
+        succeed if the second attempt doesn't fail - proving the retry path
+        actually runs rather than failing fast on the first exception.
+        """
+        face = FaceDetection(bbox=(800, 400, 1000, 600), confidence=0.9, landmarks=None)
+        frame = self.create_frame_data([face])
+
+        original = CloseupDetector._detect_closeup_from_face
+        call_count = {"n": 0}
+
+        def flaky(self, face_detection, image_properties):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError("simulated transient failure")
+            return original(self, face_detection, image_properties)
+
+        monkeypatch.setattr(CloseupDetector, "_detect_closeup_from_face", flaky)
+
+        self.detector.detect_closeups_in_frame(frame)
+
+        assert call_count["n"] == 2  # first attempt failed, second attempt ran
+        assert len(frame.closeup_detections) == 1
+        result = frame.closeup_detections[0]
+        assert result.detection_failed is False
+
+    def test_detection_permanent_failure_produces_explicit_failure_marker(self, monkeypatch):
+        """When every retry attempt fails, the face must still get an explicit
+        detection_failed=True entry with a failure_reason - never a silent
+        drop that shrinks frame.closeup_detections below len(face_detections).
+        """
+        face = FaceDetection(bbox=(800, 400, 1000, 600), confidence=0.9, landmarks=None)
+        frame = self.create_frame_data([face])
+
+        def always_fails(self, face_detection, image_properties):
+            raise RuntimeError("simulated permanent failure")
+
+        monkeypatch.setattr(
+            CloseupDetector, "_detect_closeup_from_face", always_fails
+        )
+
+        self.detector.detect_closeups_in_frame(frame)
+
+        # Count must match - the failure is traceable, not a silent drop.
+        assert len(frame.closeup_detections) == len(frame.face_detections) == 1
+        result = frame.closeup_detections[0]
+        assert result.detection_failed is True
+        assert result.is_closeup is False
+        assert "simulated permanent failure" in result.failure_reason
+
+    def test_permanent_failure_is_logged_at_error_level(self, monkeypatch, caplog):
+        """The permanent-failure path must log at ERROR level with enough
+        detail (frame id, face index) to reconcile against output counts.
+        """
+        import logging
+
+        face = FaceDetection(bbox=(800, 400, 1000, 600), confidence=0.9, landmarks=None)
+        frame = self.create_frame_data([face])
+
+        def always_fails(self, face_detection, image_properties):
+            raise RuntimeError("simulated permanent failure")
+
+        monkeypatch.setattr(
+            CloseupDetector, "_detect_closeup_from_face", always_fails
+        )
+
+        logger_name = "personfromvid.analysis.closeup_detector"
+        with caplog.at_level(logging.ERROR, logger=logger_name):
+            self.detector.detect_closeups_in_frame(frame)
+
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(error_records) == 1
+        assert frame.frame_id in error_records[0].message
+        assert "face 0" in error_records[0].message
+
+    def test_multiple_faces_one_failing_does_not_drop_the_others(self, monkeypatch):
+        """If one face's detection permanently fails, the other faces in the
+        same frame must still be processed normally and keep their results -
+        one bad face must not take down or hide the rest.
+        """
+        good_face_1 = FaceDetection(bbox=(100, 100, 300, 300), confidence=0.9, landmarks=None)
+        bad_face = FaceDetection(bbox=(800, 400, 1000, 600), confidence=0.9, landmarks=None)
+        good_face_2 = FaceDetection(bbox=(1200, 600, 1400, 800), confidence=0.9, landmarks=None)
+        frame = self.create_frame_data([good_face_1, bad_face, good_face_2])
+
+        original = CloseupDetector._detect_closeup_from_face
+
+        def fail_only_for_bad_face(self, face_detection, image_properties):
+            if face_detection is bad_face:
+                raise RuntimeError("simulated permanent failure")
+            return original(self, face_detection, image_properties)
+
+        monkeypatch.setattr(
+            CloseupDetector, "_detect_closeup_from_face", fail_only_for_bad_face
+        )
+
+        self.detector.detect_closeups_in_frame(frame)
+
+        assert len(frame.closeup_detections) == 3
+        assert frame.closeup_detections[0].detection_failed is False
+        assert frame.closeup_detections[1].detection_failed is True
+        assert frame.closeup_detections[2].detection_failed is False
+

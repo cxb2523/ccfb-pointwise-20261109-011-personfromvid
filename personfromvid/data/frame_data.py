@@ -402,6 +402,10 @@ class FrameData:
                     "inter_ocular_distance": closeup.inter_ocular_distance,
                     "estimated_distance": closeup.estimated_distance,
                     "shoulder_width_ratio": closeup.shoulder_width_ratio,
+                    "near_frame_edge": closeup.near_frame_edge,
+                    "overlaps_other_face": closeup.overlaps_other_face,
+                    "detection_failed": closeup.detection_failed,
+                    "failure_reason": closeup.failure_reason,
                 }
                 for closeup in self.closeup_detections
             ],
@@ -534,6 +538,10 @@ class FrameData:
                 inter_ocular_distance=closeup_dict.get("inter_ocular_distance"),
                 estimated_distance=closeup_dict.get("estimated_distance"),
                 shoulder_width_ratio=closeup_dict.get("shoulder_width_ratio"),
+                near_frame_edge=closeup_dict.get("near_frame_edge", False),
+                overlaps_other_face=closeup_dict.get("overlaps_other_face", False),
+                detection_failed=closeup_dict.get("detection_failed", False),
+                failure_reason=closeup_dict.get("failure_reason"),
             )
             closeup_detections.append(closeup_detection)
 

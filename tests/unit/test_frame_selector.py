@@ -544,3 +544,160 @@ class TestFrameSelectorIntegration:
         valid_reasons = {"not_top_ranked", "insufficient_diversity", "not_selected"}
         for reason in rejection_reasons:
             assert reason in valid_reasons
+
+
+class TestFrameSelectorDiversityWindow:
+    """Boundary tests for the diversity_window_size / temporal_diversity_threshold
+    trade-off in _select_diverse_frames.
+
+    All scenarios share one candidate set for a single category:
+    - A "burst" of 3 near-duplicate frames tightly spaced 0.5s apart
+      (t=0.0, 0.5, 1.0) with adjacent, closely-scored quality values.
+    - One isolated "brief pose" frame at t=3.0 (2.0s after the burst ends)
+      with a lower score, representing a short-lived distinct pose event.
+    """
+
+    def _build_burst_and_brief_event_frames(self):
+        burst_low = create_test_frame("burst_low", quality_score=0.85, timestamp=0.0)
+        burst_high = create_test_frame("burst_high", quality_score=0.90, timestamp=0.5)
+        burst_mid = create_test_frame("burst_mid", quality_score=0.88, timestamp=1.0)
+        brief_event = create_test_frame("brief_event", quality_score=0.60, timestamp=3.0)
+        return [burst_low, burst_high, burst_mid, brief_event]
+
+    def _scored(self, selector, frames):
+        return [
+            (frame, selector._calculate_pose_frame_score(frame)) for frame in frames
+        ]
+
+    def test_adjacent_near_duplicate_scores_collapse_to_single_representative(self):
+        """Two frames 0.1s apart with nearly identical scores must not both survive."""
+        criteria = SelectionCriteria(
+            min_frames_per_category=1,
+            max_frames_per_category=5,
+            min_quality_threshold=0.5,
+            face_size_weight=0.3,
+            quality_weight=0.6,
+            diversity_threshold=0.8,
+            temporal_diversity_threshold=2.0,
+            diversity_window_size=1.0,
+        )
+        selector = FrameSelector(criteria)
+
+        near_dup_a = create_test_frame("near_dup_a", quality_score=0.91, timestamp=10.0)
+        near_dup_b = create_test_frame("near_dup_b", quality_score=0.90, timestamp=10.1)
+        scored = self._scored(selector, [near_dup_a, near_dup_b])
+
+        selected, rejected = selector._select_diverse_frames(scored, max_count=5)
+
+        assert len(selected) == 1
+        assert selected[0].frame_id == "near_dup_a"  # higher score wins
+        assert len(rejected) == 1
+        assert rejected[0].frame_id == "near_dup_b"
+
+    def test_window_too_small_lets_burst_exhaust_budget_before_brief_event(self):
+        """With clustering disabled (window=0) and a threshold smaller than the
+        burst's internal spacing, every burst frame counts as "diverse enough"
+        on its own, so a tight frame budget gets consumed entirely by
+        near-duplicates of one moment before the brief, distinct pose event
+        at t=3.0 is ever reached.
+        """
+        criteria = SelectionCriteria(
+            min_frames_per_category=1,
+            max_frames_per_category=2,
+            min_quality_threshold=0.5,
+            face_size_weight=0.3,
+            quality_weight=0.6,
+            diversity_threshold=0.8,
+            temporal_diversity_threshold=0.3,  # smaller than the 0.5s burst spacing
+            diversity_window_size=0.0,  # clustering disabled
+        )
+        selector = FrameSelector(criteria)
+        frames = self._build_burst_and_brief_event_frames()
+        scored = self._scored(selector, frames)
+
+        selected, _rejected = selector._select_diverse_frames(scored, max_count=2)
+
+        selected_ids = {f.frame_id for f in selected}
+        assert len(selected) == 2
+        assert "brief_event" not in selected_ids
+        assert selected_ids == {"burst_high", "burst_mid"}
+
+    def test_window_too_large_merges_distinct_pose_events(self):
+        """A window wider than the gap to the brief event merges it into the
+        burst's cluster, so its frame can never become a cluster
+        representative - the representative frame for the brief, distinct
+        pose event gets crowded out by the surrounding higher-scoring burst.
+        """
+        criteria = SelectionCriteria(
+            min_frames_per_category=1,
+            max_frames_per_category=2,
+            min_quality_threshold=0.5,
+            face_size_weight=0.3,
+            quality_weight=0.6,
+            diversity_threshold=0.8,
+            temporal_diversity_threshold=0.3,
+            diversity_window_size=5.0,  # wider than the 2.0s gap to the brief event
+        )
+        selector = FrameSelector(criteria)
+        frames = self._build_burst_and_brief_event_frames()
+        scored = self._scored(selector, frames)
+
+        selected, rejected = selector._select_diverse_frames(scored, max_count=2)
+        selected_ids = {f.frame_id for f in selected}
+        rejected_ids = {f.frame_id for f in rejected}
+
+        # Everything collapsed into one cluster, so only its single best
+        # frame is ever a candidate representative.
+        assert "brief_event" not in selected_ids
+        assert "brief_event" in rejected_ids
+        assert selected_ids == {"burst_high"}
+
+    def test_balanced_window_preserves_both_the_burst_and_the_brief_event(self):
+        """A window sized between the burst's internal spacing (0.5s) and the
+        gap to the brief event (2.0s) collapses the near-duplicate burst into
+        one representative while still letting the distinct brief pose event
+        win its own slot.
+        """
+        criteria = SelectionCriteria(
+            min_frames_per_category=1,
+            max_frames_per_category=2,
+            min_quality_threshold=0.5,
+            face_size_weight=0.3,
+            quality_weight=0.6,
+            diversity_threshold=0.8,
+            temporal_diversity_threshold=0.3,
+            diversity_window_size=1.0,  # between 0.5s burst spacing and 2.0s gap
+        )
+        selector = FrameSelector(criteria)
+        frames = self._build_burst_and_brief_event_frames()
+        scored = self._scored(selector, frames)
+
+        selected, _rejected = selector._select_diverse_frames(scored, max_count=2)
+        selected_ids = {f.frame_id for f in selected}
+
+        assert selected_ids == {"burst_high", "brief_event"}
+
+    def test_misconfigured_window_logs_warning(self, caplog):
+        """Configuring the window wider than the final spacing threshold is a
+        real misconfiguration risk (it defeats the threshold's purpose), so
+        it must be surfaced, not silent.
+        """
+        import logging
+
+        criteria = SelectionCriteria(
+            min_frames_per_category=1,
+            max_frames_per_category=5,
+            min_quality_threshold=0.5,
+            face_size_weight=0.3,
+            quality_weight=0.6,
+            diversity_threshold=0.8,
+            temporal_diversity_threshold=1.0,
+            diversity_window_size=5.0,
+        )
+        logger_name = f"{FrameSelector.__module__}.FrameSelector"
+        with caplog.at_level(logging.WARNING, logger=logger_name):
+            FrameSelector(criteria)
+
+        assert any(
+            "diversity_window_size" in record.message for record in caplog.records
+        )

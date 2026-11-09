@@ -283,6 +283,18 @@ class FrameSelectionConfig(BaseModel):
         le=30.0,
         description="Minimum seconds between selected frames to ensure temporal diversity",
     )
+    diversity_window_size: float = Field(
+        default=1.5,
+        ge=0.0,
+        le=30.0,
+        description=(
+            "Seconds used to pre-cluster candidate frames by time before ranking "
+            "(0 disables clustering). Kept below temporal_diversity_threshold by "
+            "default so it only merges near-duplicate bursts, not distinct brief "
+            "pose events; too large crowds out short-lived poses, too small lets "
+            "near-duplicates from one event exhaust the per-category frame budget."
+        ),
+    )
 
     @field_validator("face_size_weight", "quality_weight")
     @classmethod

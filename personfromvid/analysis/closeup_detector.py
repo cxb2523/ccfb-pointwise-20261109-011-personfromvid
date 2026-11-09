@@ -36,6 +36,14 @@ SHOULDER_WIDTH_CLOSEUP_THRESHOLD = 0.35  # Shoulder width ratio for closeup dete
 MIN_FACE_CONFIDENCE = 0.3
 MIN_LANDMARK_CONFIDENCE = 0.5
 
+# Edge/overlap handling thresholds
+EDGE_MARGIN_RATIO = 0.02  # Face bbox within 2% of frame border counts as "near edge"
+FACE_OVERLAP_IOU_THRESHOLD = 0.2  # IoU above this counts as "overlapping" faces
+
+# Bounded retry so a single malformed face can't silently erase its detection
+# entry, but also can't stall the whole selection pipeline indefinitely.
+MAX_DETECTION_ATTEMPTS = 2
+
 
 class CloseupDetectionError(AnalysisError):
     """Raised when closeup detection fails."""
@@ -66,6 +74,8 @@ class CloseupDetector:
         closeup_threshold: float = CLOSEUP_THRESHOLD,
         medium_closeup_threshold: float = MEDIUM_CLOSEUP_THRESHOLD,
         medium_shot_threshold: float = MEDIUM_SHOT_THRESHOLD,
+        edge_margin_ratio: float = EDGE_MARGIN_RATIO,
+        face_overlap_iou_threshold: float = FACE_OVERLAP_IOU_THRESHOLD,
     ):
         """Initialize closeup detector with configurable thresholds.
 
@@ -74,16 +84,23 @@ class CloseupDetector:
             closeup_threshold: Face area ratio for closeup
             medium_closeup_threshold: Face area ratio for medium closeup
             medium_shot_threshold: Face area ratio for medium shot
+            edge_margin_ratio: Fraction of frame width/height within which a face
+                bbox is considered to be touching the frame edge
+            face_overlap_iou_threshold: IoU above which two face bboxes in the same
+                frame are considered overlapping
         """
         self.extreme_closeup_threshold = extreme_closeup_threshold
         self.closeup_threshold = closeup_threshold
         self.medium_closeup_threshold = medium_closeup_threshold
         self.medium_shot_threshold = medium_shot_threshold
+        self.edge_margin_ratio = edge_margin_ratio
+        self.face_overlap_iou_threshold = face_overlap_iou_threshold
 
         logger.info(
             f"Initialized CloseupDetector with thresholds: "
             f"extreme={extreme_closeup_threshold}, closeup={closeup_threshold}, "
-            f"medium_closeup={medium_closeup_threshold}, medium_shot={medium_shot_threshold}"
+            f"medium_closeup={medium_closeup_threshold}, medium_shot={medium_shot_threshold}, "
+            f"edge_margin_ratio={edge_margin_ratio}, face_overlap_iou_threshold={face_overlap_iou_threshold}"
         )
 
     def detect_closeups_in_frame(self, frame: FrameData) -> None:
@@ -100,31 +117,219 @@ class CloseupDetector:
 
         image_properties = frame.image_properties
 
-        # Process each face detection
+        # Process each face detection. The result list must always end up the
+        # same length as face_detections: every face gets either a real
+        # CloseupDetection or an explicit detection_failed=True placeholder, so
+        # a frame can never silently lose a face's worth of classification.
         for face_idx, face_detection in enumerate(frame.face_detections):
-            try:
-                # Check if we have corresponding pose data for enhanced detection
-                pose_detection = None
-                if frame.pose_detections and len(frame.pose_detections) > face_idx:
-                    pose_detection = frame.pose_detections[face_idx]
+            # Check if we have corresponding pose data for enhanced detection
+            pose_detection = None
+            if frame.pose_detections and len(frame.pose_detections) > face_idx:
+                pose_detection = frame.pose_detections[face_idx]
 
-                # Perform closeup detection
+            closeup_result = self._detect_closeup_for_face(
+                face_detection,
+                face_idx,
+                frame,
+                pose_detection,
+                image_properties,
+            )
+            frame.closeup_detections.append(closeup_result)
+
+    def _detect_closeup_for_face(
+        self,
+        face_detection: FaceDetection,
+        face_idx: int,
+        frame: FrameData,
+        pose_detection: Optional[PoseDetection],
+        image_properties: ImageProperties,
+    ) -> CloseupDetection:
+        """Detect closeup for a single face with explicit edge/overlap handling.
+
+        Edge-of-frame and multi-face-overlap cases are resolved with explicit
+        decision branches (never a silent skip). Only genuinely unexpected
+        errors go through the bounded retry below; if every attempt fails, an
+        explicit detection_failed placeholder is returned instead of dropping
+        the face's entry.
+
+        Args:
+            face_detection: Face detection result with bbox and landmarks
+            face_idx: Index of this face within frame.face_detections
+            frame: Parent frame (used for id/logging and sibling-face overlap checks)
+            pose_detection: Corresponding pose detection, if available
+            image_properties: Image properties containing dimensions
+
+        Returns:
+            CloseupDetection: always returned, even on failure (detection_failed=True)
+        """
+        near_edge, edge_reason = self._check_frame_edge_proximity(
+            face_detection.bbox, image_properties
+        )
+        overlaps, overlap_reason = self._check_face_overlap(
+            face_detection, face_idx, frame.face_detections
+        )
+
+        if near_edge:
+            logger.info(
+                f"Frame {frame.frame_id} face {face_idx}: {edge_reason}"
+            )
+        if overlaps:
+            logger.info(
+                f"Frame {frame.frame_id} face {face_idx}: {overlap_reason}"
+            )
+
+        last_error: Optional[Exception] = None
+        for attempt in range(1, MAX_DETECTION_ATTEMPTS + 1):
+            try:
                 if pose_detection:
-                    closeup_result = self._detect_closeup_with_pose_data(
+                    result = self._detect_closeup_with_pose_data(
                         face_detection, pose_detection, image_properties
                     )
                 else:
-                    closeup_result = self._detect_closeup_from_face(
+                    result = self._detect_closeup_from_face(
                         face_detection, image_properties
                     )
-
-                frame.closeup_detections.append(closeup_result)
+                result.near_frame_edge = near_edge
+                result.overlaps_other_face = overlaps
+                return result
 
             except Exception as e:
-                logger.error(
-                    f"Failed to detect closeup for face {face_idx} in frame {frame.frame_id}: {e}"
+                last_error = e
+                logger.warning(
+                    f"Closeup detection attempt {attempt}/{MAX_DETECTION_ATTEMPTS} "
+                    f"failed for frame {frame.frame_id} face {face_idx}: {e}"
                 )
-                # Continue processing other faces
+
+        # All attempts exhausted: explicit failure marker instead of a silent
+        # drop, so counts (len(closeup_detections) == len(face_detections))
+        # and logs stay reconcilable.
+        logger.error(
+            f"Closeup detection permanently failed for frame {frame.frame_id} "
+            f"face {face_idx} after {MAX_DETECTION_ATTEMPTS} attempt(s): {last_error}"
+        )
+        return CloseupDetection(
+            is_closeup=False,
+            shot_type="unknown",
+            confidence=0.0,
+            face_area_ratio=0.0,
+            near_frame_edge=near_edge,
+            overlaps_other_face=overlaps,
+            detection_failed=True,
+            failure_reason=str(last_error),
+        )
+
+    @staticmethod
+    def _clamp_bbox_to_frame(
+        bbox: Tuple[int, int, int, int],
+        image_properties: ImageProperties,
+    ) -> Tuple[int, int, int, int]:
+        """Clamp a bbox to the visible frame region (never raises).
+
+        Args:
+            bbox: Face bounding box as (x1, y1, x2, y2), possibly out of bounds
+            image_properties: Image properties containing frame dimensions
+
+        Returns:
+            Bbox clamped to [0, width] x [0, height]
+        """
+        x1, y1, x2, y2 = bbox
+        width, height = image_properties.width, image_properties.height
+
+        clamped_x1 = max(0, min(x1, width))
+        clamped_y1 = max(0, min(y1, height))
+        clamped_x2 = max(clamped_x1, min(x2, width))
+        clamped_y2 = max(clamped_y1, min(y2, height))
+
+        return (clamped_x1, clamped_y1, clamped_x2, clamped_y2)
+
+    def _check_frame_edge_proximity(
+        self,
+        bbox: Tuple[int, int, int, int],
+        image_properties: ImageProperties,
+    ) -> Tuple[bool, str]:
+        """Explicitly detect whether a face bbox touches/exceeds the frame edge.
+
+        Args:
+            bbox: Face bounding box as (x1, y1, x2, y2)
+            image_properties: Image properties containing frame dimensions
+
+        Returns:
+            Tuple of (near_edge: bool, human_readable_reason: str)
+        """
+        x1, y1, x2, y2 = bbox
+        width, height = image_properties.width, image_properties.height
+
+        if x1 < 0 or y1 < 0 or x2 > width or y2 > height:
+            return True, (
+                f"face bbox {bbox} extends beyond frame bounds ({width}x{height}); "
+                "using the visible (clamped) region for shot classification"
+            )
+
+        margin_x = width * self.edge_margin_ratio
+        margin_y = height * self.edge_margin_ratio
+        if (
+            x1 <= margin_x
+            or y1 <= margin_y
+            or x2 >= width - margin_x
+            or y2 >= height - margin_y
+        ):
+            return True, (
+                f"face bbox {bbox} is within {self.edge_margin_ratio:.0%} of the "
+                f"frame edge ({width}x{height})"
+            )
+
+        return False, ""
+
+    def _check_face_overlap(
+        self,
+        face_detection: FaceDetection,
+        face_idx: int,
+        all_faces: List[FaceDetection],
+    ) -> Tuple[bool, str]:
+        """Explicitly detect whether this face bbox overlaps another face in the frame.
+
+        Args:
+            face_detection: The face being checked
+            face_idx: Index of face_detection within all_faces
+            all_faces: All face detections in the same frame
+
+        Returns:
+            Tuple of (overlaps: bool, human_readable_reason: str)
+        """
+        for other_idx, other in enumerate(all_faces):
+            if other_idx == face_idx:
+                continue
+
+            iou = self._calculate_bbox_iou(face_detection.bbox, other.bbox)
+            if iou >= self.face_overlap_iou_threshold:
+                return True, (
+                    f"face bbox overlaps face {other_idx} with IoU={iou:.2f} "
+                    f">= threshold {self.face_overlap_iou_threshold}"
+                )
+
+        return False, ""
+
+    @staticmethod
+    def _calculate_bbox_iou(
+        bbox_a: Tuple[int, int, int, int], bbox_b: Tuple[int, int, int, int]
+    ) -> float:
+        """Calculate intersection-over-union between two bounding boxes."""
+        ax1, ay1, ax2, ay2 = bbox_a
+        bx1, by1, bx2, by2 = bbox_b
+
+        inter_x1, inter_y1 = max(ax1, bx1), max(ay1, by1)
+        inter_x2, inter_y2 = min(ax2, bx2), min(ay2, by2)
+        inter_w, inter_h = max(0, inter_x2 - inter_x1), max(0, inter_y2 - inter_y1)
+        inter_area = inter_w * inter_h
+
+        if inter_area <= 0:
+            return 0.0
+
+        area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+        area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+        union = area_a + area_b - inter_area
+
+        return inter_area / union if union > 0 else 0.0
 
     def _detect_closeup_from_face(
         self, face_detection: FaceDetection, image_properties: ImageProperties
@@ -144,9 +349,18 @@ class CloseupDetector:
         try:
             frame_area = image_properties.total_pixels
 
-            # Calculate face area ratio
-            face_area = face_detection.area
-            face_area_ratio = face_area / frame_area
+            # Calculate face area ratio using the bbox clamped to the visible
+            # frame region. A face bbox extending past the frame edge is a
+            # normal, expected case (handled explicitly here) rather than an
+            # error - it must not inflate the ratio above 1.0 and must not
+            # raise, since that would silently erase this face's detection.
+            visible_bbox = self._clamp_bbox_to_frame(
+                face_detection.bbox, image_properties
+            )
+            visible_width = max(0, visible_bbox[2] - visible_bbox[0])
+            visible_height = max(0, visible_bbox[3] - visible_bbox[1])
+            face_area = visible_width * visible_height
+            face_area_ratio = min(1.0, face_area / frame_area) if frame_area > 0 else 0.0
 
             # Classify shot type based on face area ratio
             shot_type = self._classify_shot_type(face_area_ratio)
@@ -412,5 +626,10 @@ class CloseupDetector:
             },
             "detection_constants": {
                 "shoulder_width_closeup_threshold": SHOULDER_WIDTH_CLOSEUP_THRESHOLD,
+            },
+            "edge_and_overlap_handling": {
+                "edge_margin_ratio": self.edge_margin_ratio,
+                "face_overlap_iou_threshold": self.face_overlap_iou_threshold,
+                "max_detection_attempts": MAX_DETECTION_ATTEMPTS,
             },
         }

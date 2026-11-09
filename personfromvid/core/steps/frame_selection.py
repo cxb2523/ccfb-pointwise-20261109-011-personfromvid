@@ -78,6 +78,7 @@ class FrameSelectionStep(PipelineStep):
                 quality_weight=self.config.frame_selection.quality_weight,
                 diversity_threshold=self.config.frame_selection.diversity_threshold,
                 temporal_diversity_threshold=self.config.frame_selection.temporal_diversity_threshold,
+                diversity_window_size=self.config.frame_selection.diversity_window_size,
             )
             frame_selector = create_frame_selector(criteria)
             self._state.get_step_progress(self.step_name).start(total_candidates)
